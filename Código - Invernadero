@@ -1,0 +1,149 @@
+import math
+import dht
+from machine import Pin, ADC, time_pulse_us
+from utime import sleep_ms, sleep_us, ticks_ms
+
+# --- 1. CONFIGURACIÓN DE HARDWARE ---
+# Sensor DHT22 (Temperatura y Humedad)
+dht_sen = dht.DHT22(Pin(4))
+
+# Sensor de Luz (LDR) en Pin 32
+adc_ldr = ADC(Pin(32))
+adc_ldr.atten(ADC.ATTN_11DB) # Rango completo de 0-3.3V
+
+# Sensor Ultrasonido (Nivel de Agua)
+trigger = Pin(5, Pin.OUT)
+echo = Pin(18, Pin.IN)
+
+# Botón de Emergencia (Pin 16)
+boton_em = Pin(16, Pin.IN, Pin.PULL_UP)
+
+# --- ACTUADORES ---
+ventilador = Pin(21, Pin.OUT)   # Extractores / Ventilación
+calefaccion = Pin(22, Pin.OUT)  # Humidificación / Nebulización
+luces_led = Pin(23, Pin.OUT)    # Iluminación Artificial
+bomba_llenado = Pin(19, Pin.OUT)
+alarma = Pin(15, Pin.OUT)
+
+# --- 2. VARIABLES DE CONTROL Y CONSTANTES ---
+GAMMA = 0.7
+RL10 = 50 
+sistema_activo = True
+ultimo_pulso = 0
+
+# --- 3. FUNCIONES DE MEDICIÓN ---
+
+def medir_distancia():
+    """Medición de nivel de agua en cm"""
+    trigger.off()
+    sleep_us(2)
+    trigger.on()
+    sleep_us(10)
+    trigger.off()
+    t = time_pulse_us(echo, 1, 30000)
+    return (t * 0.0343) / 2 if t > 0 else 0
+
+def calcular_lux():
+    """Conversión de lectura ADC a Lux"""
+    val = adc_ldr.read()
+    if val <= 0: return 0
+    voltaje = val / 4095 * 3.3
+    if voltaje >= 3.3: return 0
+    # Cálculo de resistencia del LDR
+    resistencia = (10000 * voltaje) / (3.3 - voltaje)
+    try:
+        # Fórmula logarítmica para Lux
+        return math.pow(RL10 * 1000 * math.pow(10, GAMMA) / resistencia, (1 / GAMMA))
+    except:
+        return 0
+
+# --- 4. CONTROL MANUAL DE EMERGENCIA ---
+def manejar_emergencia(pin):
+    global sistema_activo, ultimo_pulso
+    ahora = ticks_ms()
+    if ahora - ultimo_pulso > 300: # Anti-rebote
+        sistema_activo = not sistema_activo
+        ultimo_pulso = ahora
+        if not sistema_activo:
+            for act in [ventilador, calefaccion, luces_led, bomba_llenado]: act.off()
+            alarma.on()
+            print("\n********** EMERGENCIA - SISTEMA DESACTIVADO **********")
+        else:
+            alarma.off()
+            print("\n********** SISTEMA REARMADO Y ACTIVO **********")
+
+boton_em.irq(trigger=Pin.IRQ_FALLING, handler=manejar_emergencia)
+
+# --- 5. INICIO Y ESTABILIZACIÓN ---
+print("SISTEMA INTEGRAL DE MONITOREO - CORHUILA")
+print("ESTABILIZANDO SENSORES, POR FAVOR ESPERE...")
+sleep_ms(2000) # Pausa para evitar fluctuaciones iniciales de Lux y DHT
+
+# --- 6. BUCLE DE CONTROL PRINCIPAL ---
+while True:
+    if not sistema_activo:
+        sleep_ms(500)
+        continue
+
+    try:
+        # Lectura de sensores
+        dht_sen.measure()
+        temp = dht_sen.temperature()
+        hum = dht_sen.humidity()
+        lx = calcular_lux()
+        dist = medir_distancia()
+
+        # Monitoreo en consola
+        print("\n T: {:.1f}C | H: {:.1f}% | L: {:.1f}lx | D: {:.1f}cm".format(temp, hum, lx, dist))
+
+        # --- LÓGICA DE CONTROL ---
+
+        # 1 y 2. CONTROL DE TEMPERATURA Y HUMEDAD
+        if temp > 37:
+            if hum > 80:
+                ventilador.on()
+                calefaccion.on() # Ambos para bajar temp y extraer humedad
+                print("EXTRACTORES - ACTIVADO")
+            elif hum < 40:
+                calefaccion.on()
+                ventilador.on()
+                print("NEBULIZACIÓN Y VENTILACIÓN ACTIVADO")
+            else:
+                ventilador.on()
+                calefaccion.off()
+                print("VENTILACIÓN ; CALEFACCIÓN - ACTIVADO")
+        
+        elif temp < 2:
+            ventilador.on()
+            print("CALEFACCIÓN ; HUMIDIFICADOR - ACTIVADO")
+        
+        else:
+            # Rango de temperatura normal
+            ventilador.off()
+            calefaccion.off()
+            # Condición de humedad independiente
+            if hum < 40:
+                calefaccion.on()
+                print("NEBULIZACIÓN - ACTIVADO ")
+
+        # 3. CONTROL DE LUMINOSIDAD
+        if lx < 100:
+            luces_led.on()
+            print("LUCES ARTIFICIALES - ACTIVADO")
+        else:
+            luces_led.off()
+
+        # 4. CONTROL DE NIVEL DE AGUA
+        if dist > 180:
+            bomba_llenado.on()
+            alarma.on()
+            print("TANQUE VACÍO - BOMBA DE LLENADO ACTIVADO")
+        elif dist < 20:
+            bomba_llenado.off()
+            alarma.off()
+            print("TANQUE LLENO - BOMBA APAGADA")
+
+    except Exception as e:
+        print("FALLO EN SENSORES", e)
+    
+    sleep_ms(2000)
